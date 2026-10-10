@@ -39,6 +39,11 @@ counts, selected summary values, and the existence of the principal figures.
 Neither command retrains models. The reproduced panel from Liu et al.'s paper
 is not redistributed here; consult the cited original publication.
 
+GitHub Actions runs these two commands on pushes, pull requests, version tags,
+and manual dispatch using the pinned packages in
+[`requirements-analysis.txt`](requirements-analysis.txt). This CPU-only check
+does not rerun the training experiments or the separate GPU smoke test.
+
 The compact inputs committed here are:
 
 | Result | Source file |
