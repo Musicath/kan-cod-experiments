@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Run artifacts can contain machine-specific paths and host information.
+experiments/runs/
+experiments/manifests/generated/
+experiments/figures/
+COD_of_KAN/
+
+# Keep the curated source tables, not large server archives or regenerated tables.
+*.tar.gz
+*.pt
+*.pth
+*.ckpt
+experiments/data/processed/**/*.csv
+experiments/data/processed/**/*.pdf
+experiments/data/processed/**/*.png
+experiments/diagnostics/constructive_example2/results/*.json
+experiments/diagnostics/constructive_example2/results/*.pdf
+experiments/diagnostics/constructive_example2/results/*.png

@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+"""Full MNIST random-label scan used for the paper's N=60,000 experiment.
+
+The official MNIST training images are retained while labels are independently
+randomized for each seed. The script is resumable per run and supports static
+sharding across several GPUs or processes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import random
+import time
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable
+
+import numpy as np
+import torch
+from torch import nn, optim
+from torch.utils.data import DataLoader, Dataset
+from torchvision.datasets import MNIST
+from torchvision.transforms import ToTensor
+
+from run_mnist_normal_labels import (
+    DEPTHS,
+    KAN_WIDTHS,
+    MLP_WIDTHS,
+    OPTIM_LRS,
+    PlainMLP,
+    count_params,
+    import_kan,
+    set_seed,
+    shutdown_loader,
+)
+
+
+SEEDS = [0, 1, 2]
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    n_train: int
+    model: str
+    width: int
+    depth: int
+    seed: int
+    optimizer: str
+    lr: float
+
+    @property
+    def key(self) -> str:
+        lr_tag = f"{self.lr:g}".replace(".", "p").replace("-", "m")
+        return (
+            f"mnist_random_N{self.n_train}_{self.model}_L{self.depth}_w{self.width}"
+            f"_seed{self.seed}_{self.optimizer}_lr{lr_tag}"
+        )
+
+
+class RandomLabelSubset(Dataset):
+    def __init__(self, dataset: MNIST, indices: torch.Tensor, labels: torch.Tensor):
+        self.dataset = dataset
+        self.indices = indices.tolist()
+        self.labels = labels
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, position: int) -> tuple[torch.Tensor, torch.Tensor]:
+        image, _ = self.dataset[self.indices[position]]
+        return image, self.labels[position]
+
+
+def make_model(
+    cfg: RunConfig,
+    device: torch.device,
+    kan_edge_base: str = "zero",
+) -> nn.Module:
+    set_seed(cfg.seed)
+    if cfg.model == "MLP":
+        return PlainMLP(cfg.width, cfg.depth).to(device)
+
+    KAN = import_kan()
+    shape = [784] + [cfg.width] * cfg.depth + [10]
+    use_silu_base = kan_edge_base == "silu"
+    model = KAN(
+        width=shape,
+        grid=3,
+        k=3,
+        seed=cfg.seed,
+        device=str(device),
+        auto_save=False,
+        symbolic_enabled=False,
+        save_act=False,
+        base_fun="silu" if use_silu_base else "zero",
+        scale_base_sigma=0.1 if use_silu_base else 0.0,
+        sp_trainable=False,
+        sb_trainable=use_silu_base,
+    )
+    if hasattr(model, "symbolic_fun"):
+        for parameter in model.symbolic_fun.parameters():
+            parameter.requires_grad_(False)
+    if hasattr(model, "speed"):
+        model.speed()
+    return model
+
+
+def make_loaders(
+    data_root: Path,
+    n_train: int,
+    batch_size: int,
+    eval_batch_size: int,
+    seed: int,
+    num_workers: int,
+) -> tuple[DataLoader, DataLoader]:
+    dataset = MNIST(str(data_root), train=True, download=True, transform=ToTensor())
+    if not 1 <= n_train <= len(dataset):
+        raise ValueError(f"n_train must be in [1, {len(dataset)}], got {n_train}.")
+
+    subset_generator = torch.Generator()
+    subset_generator.manual_seed(20_000 + seed * 997 + n_train)
+    indices = torch.randperm(len(dataset), generator=subset_generator)[:n_train]
+
+    label_generator = torch.Generator()
+    label_generator.manual_seed(10_000 + seed * 997)
+    labels = torch.randint(0, 10, (n_train,), generator=label_generator, dtype=torch.long)
+    randomized = RandomLabelSubset(dataset, indices, labels)
+
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(30_000 + seed * 997)
+    common = {
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "persistent_workers": num_workers > 0,
+    }
+    train_loader = DataLoader(
+        randomized,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=loader_generator,
+        **common,
+    )
+    eval_loader = DataLoader(
+        randomized,
+        batch_size=eval_batch_size,
+        shuffle=False,
+        **common,
+    )
+    return train_loader, eval_loader
+
+
+def flatten_to_device(x: torch.Tensor, device: torch.device) -> torch.Tensor:
+    return x.view(x.shape[0], -1).to(device, non_blocking=True)
+
+
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    loss_fn: nn.Module,
+) -> tuple[float, float]:
+    model.eval()
+    loss_sum = 0.0
+    correct = 0
+    count = 0
+    for x, y in loader:
+        x = flatten_to_device(x, device)
+        y = y.to(device, non_blocking=True)
+        logits = model(x)
+        loss_sum += loss_fn(logits, y).item() * y.numel()
+        correct += (logits.argmax(dim=1) == y).sum().item()
+        count += y.numel()
+    return loss_sum / count, correct / count
+
+
+def train_one(
+    model: nn.Module,
+    cfg: RunConfig,
+    train_loader: DataLoader,
+    eval_loader: DataLoader,
+    device: torch.device,
+    epochs: int,
+    progress_every: int,
+) -> dict[str, float | int]:
+    if cfg.optimizer == "adam":
+        optimizer = optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=0.0)
+    else:
+        optimizer = optim.SGD(
+            model.parameters(), lr=cfg.lr, momentum=0.9, weight_decay=0.0
+        )
+    loss_fn = nn.CrossEntropyLoss()
+    best_online_train_acc = 0.0
+    best_epoch = 0
+
+    start = time.perf_counter()
+    for epoch in range(1, epochs + 1):
+        model.train()
+        correct = 0
+        count = 0
+        loss_sum = 0.0
+        for x, y in train_loader:
+            x = flatten_to_device(x, device)
+            y = y.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(x)
+            loss = loss_fn(logits, y)
+            loss.backward()
+            optimizer.step()
+            loss_sum += loss.item() * y.numel()
+            correct += (logits.argmax(dim=1) == y).sum().item()
+            count += y.numel()
+
+        online_acc = correct / count
+        if online_acc > best_online_train_acc:
+            best_online_train_acc = online_acc
+            best_epoch = epoch
+        if epoch == 1 or epoch % progress_every == 0 or epoch == epochs:
+            print(
+                f"  epoch={epoch:03d}/{epochs} online_train_loss={loss_sum / count:.6f} "
+                f"online_train_acc={online_acc:.6f}",
+                flush=True,
+            )
+
+    elapsed_sec = time.perf_counter() - start
+    final_train_loss, final_train_acc = evaluate(model, eval_loader, device, loss_fn)
+    return {
+        "best_online_train_acc": best_online_train_acc,
+        "best_online_train_epoch": best_epoch,
+        "final_train_loss": final_train_loss,
+        "final_train_acc": final_train_acc,
+        "elapsed_sec": elapsed_sec,
+    }
+
+
+def iter_configs(args: argparse.Namespace) -> Iterable[RunConfig]:
+    models = ["MLP", "KAN"] if args.models is None else args.models
+    for seed in args.seeds:
+        for model in models:
+            widths = args.mlp_widths if model == "MLP" else args.kan_widths
+            for depth in args.depths:
+                for width in widths:
+                    for optimizer_name in args.optimizers:
+                        for lr in OPTIM_LRS[optimizer_name]:
+                            yield RunConfig(
+                                args.n_train,
+                                model,
+                                width,
+                                depth,
+                                seed,
+                                optimizer_name,
+                                lr,
+                            )
+
+
+def atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+
+
+def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def percentile(values: list[float], q: float) -> float:
+    return float(np.percentile(np.asarray(values, dtype=float), q))
+
+
+def aggregate(out_root: Path) -> None:
+    rows = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((out_root / "per_run").glob("*/result.json"))
+    ]
+    if not rows:
+        print(f"No completed runs found under {out_root}", flush=True)
+        return
+
+    rows.sort(
+        key=lambda row: (
+            row["model"], row["depth"], row["width"], row["seed"],
+            row["optimizer"], row["lr"],
+        )
+    )
+    write_csv(out_root / "raw_results.csv", rows)
+
+    grouped: dict[tuple[object, ...], list[dict[str, object]]] = {}
+    for row in rows:
+        key = (row["model"], row["depth"], row["width"], row["seed"])
+        grouped.setdefault(key, []).append(row)
+    best = [
+        max(
+            candidates,
+            key=lambda row: (
+                float(row["final_train_acc"]),
+                -float(row["final_train_loss"]),
+                float(row["best_online_train_acc"]),
+            ),
+        )
+        for candidates in grouped.values()
+    ]
+    best.sort(key=lambda row: (row["model"], row["depth"], row["width"], row["seed"]))
+    write_csv(out_root / "best_by_architecture_seed.csv", best)
+
+    architecture_groups: dict[tuple[object, ...], list[dict[str, object]]] = {}
+    for row in best:
+        key = (row["model"], row["depth"], row["width"], row["params"])
+        architecture_groups.setdefault(key, []).append(row)
+    summaries = []
+    for key, candidates in architecture_groups.items():
+        summary: dict[str, object] = {
+            "model": key[0],
+            "depth": key[1],
+            "width": key[2],
+            "params": key[3],
+            "completed_seeds": len(candidates),
+        }
+        for metric in ["best_online_train_acc", "final_train_acc", "final_train_loss"]:
+            values = [float(row[metric]) for row in candidates]
+            summary[f"{metric}_median"] = percentile(values, 50)
+            summary[f"{metric}_q25"] = percentile(values, 25)
+            summary[f"{metric}_q75"] = percentile(values, 75)
+        summaries.append(summary)
+    summaries.sort(key=lambda row: (row["model"], row["params"], row["depth"], row["width"]))
+    write_csv(out_root / "summary.csv", summaries)
+    print(
+        f"Aggregated {len(rows)} runs, {len(best)} selected architecture-seed rows, "
+        f"and {len(summaries)} architecture summaries under {out_root}",
+        flush=True,
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-root", type=Path, default=Path("data"))
+    parser.add_argument("--results-root", type=Path, default=Path("results"))
+    parser.add_argument("--run-name", default="mnist_random_labels_N60000_full")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--n-train", type=int, default=60000)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--eval-batch-size", type=int, default=512)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--progress-every", type=int, default=20)
+    parser.add_argument("--models", nargs="+", choices=["MLP", "KAN"])
+    parser.add_argument("--depths", nargs="+", type=int, default=DEPTHS)
+    parser.add_argument("--mlp-widths", nargs="+", type=int, default=MLP_WIDTHS)
+    parser.add_argument("--kan-widths", nargs="+", type=int, default=KAN_WIDTHS)
+    parser.add_argument("--seeds", nargs="+", type=int, default=SEEDS)
+    parser.add_argument("--optimizers", nargs="+", choices=["sgd", "adam"], default=["sgd", "adam"])
+    parser.add_argument(
+        "--kan-edge-base",
+        choices=["zero", "silu"],
+        default="zero",
+        help="Use a spline-only KAN (zero) or the practical SiLU edge-base branch.",
+    )
+    parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--aggregate-only", action="store_true")
+    parser.add_argument("--no-aggregate", action="store_true")
+    parser.add_argument("--max-runs", type=int, default=0)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("Require 0 <= shard-index < num-shards.")
+
+    out_root = args.results_root / args.run_name
+    if args.aggregate_only:
+        aggregate(out_root)
+        return 0
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    all_configs = list(iter_configs(args))
+    shard_configs = [
+        cfg for index, cfg in enumerate(all_configs)
+        if index % args.num_shards == args.shard_index
+    ]
+    if args.max_runs > 0:
+        shard_configs = shard_configs[: args.max_runs]
+
+    out_root.mkdir(parents=True, exist_ok=True)
+    config_payload = {
+        "created_at": datetime.now().isoformat(),
+        "n_train": args.n_train,
+        "random_labels": True,
+        "label_seed_formula": "10000 + seed * 997",
+        "subset_seed_formula": "20000 + seed * 997 + n_train",
+        "grid": 3,
+        "spline_degree": 3,
+        "kan_base_fun": args.kan_edge_base,
+        "kan_scale_base_sigma": 0.1 if args.kan_edge_base == "silu" else 0.0,
+        "kan_sp_trainable": False,
+        "kan_sb_trainable": args.kan_edge_base == "silu",
+        "layerwise_residual": False,
+        "weight_decay": 0.0,
+        "optimizer_lrs": OPTIM_LRS,
+        "total_cartesian_runs": len(all_configs),
+        **vars(args),
+    }
+    config_payload = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in config_payload.items()
+    }
+    atomic_write_json(out_root / f"run_config_shard{args.shard_index}.json", config_payload)
+
+    completed = 0
+    for cfg in shard_configs:
+        result_path = out_root / "per_run" / cfg.key / "result.json"
+        if args.skip_existing and result_path.exists():
+            print(f"Skipping existing {cfg.key}", flush=True)
+            continue
+
+        print(f"Starting {cfg.key} on {device}", flush=True)
+        train_loader, eval_loader = make_loaders(
+            args.data_root,
+            args.n_train,
+            args.batch_size,
+            args.eval_batch_size,
+            cfg.seed,
+            args.num_workers,
+        )
+        model = make_model(cfg, device, args.kan_edge_base)
+        params = count_params(model)
+        print(f"  params={params}", flush=True)
+        metrics = train_one(
+            model,
+            cfg,
+            train_loader,
+            eval_loader,
+            device,
+            args.epochs,
+            args.progress_every,
+        )
+        row: dict[str, object] = {
+            "run_key": cfg.key,
+            **asdict(cfg),
+            "params": params,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            **metrics,
+        }
+        atomic_write_json(result_path, row)
+        print(
+            f"Completed {cfg.key}: train_acc={metrics['final_train_acc']:.6f} "
+            f"elapsed={metrics['elapsed_sec']:.1f}s",
+            flush=True,
+        )
+        completed += 1
+        shutdown_loader(train_loader)
+        shutdown_loader(eval_loader)
+        del model, train_loader, eval_loader
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if not args.no_aggregate:
+        aggregate(out_root)
+    print(f"Shard {args.shard_index} completed {completed} new runs.", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
